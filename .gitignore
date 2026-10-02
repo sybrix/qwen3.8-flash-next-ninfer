@@ -1,0 +1,8 @@
+/ninfer-flash-next/build/
+/ninfer-flash-next/models/
+*.ninfer
+*.pt
+*.nsys-rep
+*.sqlite
+.venv/
+__pycache__/

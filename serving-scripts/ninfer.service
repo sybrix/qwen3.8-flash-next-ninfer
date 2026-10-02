@@ -1,0 +1,28 @@
+[Unit]
+Description=NInfer - Qwen3.8-27B NVFP4 (vision, 262144 ctx) OpenAI/Anthropic server on :8000
+Documentation=file:///home/YOUR_USER/serving-scripts/start-ninfer.sh
+# GPU clock/CPU-governor lock should be applied first.
+After=network-online.target nvidia-persistenced.service vllm-gpu-performance.service
+Wants=network-online.target vllm-gpu-performance.service
+# NInfer and vLLM both bind :8000. Starting either one stops the other.
+Conflicts=vllm-qwen3.8.service
+
+[Service]
+Type=simple
+User=YOUR_USER
+Group=YOUR_USER
+# start-ninfer.sh (no args) runs its pre-flight checks, then execs ninfer-serve
+# in the foreground, so systemd owns the server process directly.
+ExecStart=/home/YOUR_USER/serving-scripts/start-ninfer.sh
+# Keep the existing log location that --check users and serve.log greps expect.
+StandardOutput=append:/home/YOUR_USER/Projects/ninfer/serve.log
+StandardError=append:/home/YOUR_USER/Projects/ninfer/serve.log
+# SIGTERM stops the listen loop once warmup is done; weights load in ~10s.
+TimeoutStartSec=300
+TimeoutStopSec=30
+# Same policy as the vLLM unit: once stopped/crashed it stays down until a
+# reboot or an explicit `systemctl start ninfer`.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
