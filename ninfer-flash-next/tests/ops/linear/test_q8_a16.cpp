@@ -16,7 +16,7 @@ struct Geometry {
 
 constexpr std::array kGeometries{
     Geometry{1024, 2048, 257U},  Geometry{1024, 5120, 223U},  Geometry{2048, 4096, 251U},
-    Geometry{2048, 4608, 271U},  Geometry{2048, 16384, 283U}, Geometry{4608, 4608, 277U},
+    Geometry{2048, 4608, 271U},  Geometry{2560, 4608, 271U},  Geometry{2048, 16384, 283U}, Geometry{4608, 4608, 277U}, Geometry{1152, 1536, 263U}, Geometry{4352, 1152, 263U}, Geometry{1152, 4352, 263U}, Geometry{1152, 1152, 263U}, Geometry{3456, 1152, 263U},
     Geometry{5120, 4608, 281U},  Geometry{5120, 6144, 239U},  Geometry{5120, 10240, 211U},
     Geometry{5120, 17408, 241U}, Geometry{5120, 25600, 293U}, Geometry{6144, 5120, 227U},
     Geometry{9216, 2048, 263U},  Geometry{12288, 2048, 269U}, Geometry{14336, 5120, 229U},

@@ -15,6 +15,8 @@ Upstream NInfer did not support this architecture. The port adds every feature t
 - **512-expert NVFP4 MoE:** top-10 routing plus a shared expert.
 - **Per-layer n-gram embedding (PLE):** a 53.7 GB FP8 hash table, memory-mapped from disk.
 - **The model's own MTP head:** used for speculative decoding.
+- **Image input:** the vision tower (the same as Qwen3.5's), whose 3-axis rotary positions are
+  carried into the sparse-attention selector.
 
 ## Results
 
@@ -27,10 +29,18 @@ Measured on one RTX PRO 6000 Blackwell Max-Q, with FP8 KV cache:
 | Decode, no speculation | 77 tok/s (54 tok/s at 8K context) |
 | Decode, MTP with 3 draft tokens, greedy | **170 tok/s**; 88% of drafts accepted |
 | Decode, MTP, ~8K context | 90 tok/s |
-| GPU memory | ~80 GiB with 262K context, 2 concurrent requests |
+| Image prompts with MTP (chart / photo + 3K tokens of text) | 110 / 91 tok/s |
+| GPU memory | ~83 GiB with 262K context, 2 concurrent requests, vision on |
 
 **Correctness:** greedy MTP output matches non-speculative output. Teacher-forced through the
 reference, it agreed on 265 of 270 tokens, and every mismatch was a near-tie (logit gap ≤ 0.5).
+With images it agreed on 121/128 tokens (chart) and 88/96 (photo plus 3K tokens of text), again
+only at near-ties.
+
+**Vision precision:** the vision MLP is zero-padded from 4,304 to 4,352 at conversion, which is
+mathematically exact, so every vision projection runs at Q8. The 4/5-bit mix NInfer uses for
+Qwen3.5 vision moved this model's image embeddings about 35% from BF16 (cosine 0.94) and made it
+misread text in images. Q8 keeps them within about 6% (cosine 0.998).
 
 ## Repository layout
 
@@ -49,12 +59,12 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
 # 2. Convert the checkpoint to a NInfer artifact (~30 min, ~131 GB, needs ~131 GB free disk).
-#    --components text,mtp includes the MTP draft head.
+#    --components text,mtp,vision includes the MTP draft head and the vision tower.
 #    --max-file-bytes keeps it one file; the memory-mapped n-gram table must not span files.
 python -m tools.convert --model /path/to/Qwen3.8-Flash-Next-NVFP4 \
-    --recipe qwen3_8_flash_next_nvfp4 --components text,mtp \
+    --recipe qwen3_8_flash_next_nvfp4 --components text,mtp,vision \
     --name qwen3.8-flash-next --max-file-bytes 200000000000 \
-    --out models/qwen3_8_flash_next_nvfp4_mtp.ninfer
+    --out models/qwen3_8_flash_next_nvfp4_mtp_vision.ninfer
 
 # 3. Serve it (OpenAI + Anthropic APIs on :8000)
 ../serving-scripts/start-flash-next.sh
@@ -68,7 +78,8 @@ The serving scripts default to `$HOME/Projects/ninfer-flash-next`. Override this
 - **GPU:** a 96 GB Blackwell GPU. Weights use about 72.5 GiB.
 - **RAM and disk:** about 64 GB of RAM and a fast NVMe. The 53.7 GB n-gram table stays on disk
   and is read through the page cache, so a cold cache adds about 0.4 s to an 8K prompt.
-- **Text only:** vision input and DFlash speculation are not implemented for this architecture.
+- **Speculation:** MTP only; DFlash speculation is not implemented for this architecture.
+- **Images:** videos use the same path as images but were not separately validated.
 - **KV cache format:** contexts beyond 2,051 tokens use sparse attention, which needs a BF16 or
   FP8 KV cache.
 
@@ -82,7 +93,9 @@ because `transformers` does not load the MTP weights. Validation used:
 - perplexity at 4K and 8K context;
 - concurrency, prefix-reuse and multi-turn tests on a synthetic 4-layer checkpoint with the
   real per-layer shapes;
-- bit-exact unit tests for every new kernel.
+- bit-exact unit tests for every new kernel;
+- image prompts, short and past the sparse-attention threshold, teacher-forced through the
+  reference with the checkpoint's own vision tower.
 
 [`ninfer-flash-next/docs/maintainer/qwen4_exp-model.md`](ninfer-flash-next/docs/maintainer/qwen4_exp-model.md)
 describes the model's mathematics and how the implementation maps onto NInfer.

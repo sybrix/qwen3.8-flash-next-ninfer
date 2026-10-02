@@ -183,4 +183,13 @@ Phase 1 runs Text Prefill and ordinary decode from the NVIDIA ModelOpt NVFP4 exp
   registered for 36 layers), and the PLE convolution uses `ple_conv_residual_record` +
   `ple_conv_replay_fold`. Verify columns' PLE rows are hashed on the host from the ledger and the
   host-held drafts and travel in the MTP round ingress.
-- Vision and DFlash are rejected for this architecture.
+- Vision is the Qwen3.5 tower (identical in transformers) with Qwen3.5 3-axis Text MRoPE
+  positions. Qwen4Exp scatters Vision columns into the [H,T] token embedding before the stream
+  broadcast. The Vision MLP is zero-padded 4304 -> 4352 at conversion (exact) so every Vision
+  projection runs at Q8: the Qwen3.5 Q4/Q5 Vision recipe moves image embeddings ~35% from BF16
+  (cosine 0.94), Q8 ~6% (cosine 0.998).
+- QSA rotates index queries with the columns' RoPE positions ([T] or [T,3]) and records each
+  token's three axes in a layer-independent I32 [4,64,1,pages] plane of the Main (and MTP) paged
+  pool; pooled blocks rotate with their first token's recorded position, which multimodal
+  prompts need beyond the dense-equivalent extent.
+- DFlash is rejected for this architecture.

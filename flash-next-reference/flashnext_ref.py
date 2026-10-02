@@ -248,6 +248,89 @@ def run_mtp(text, ckpt, device, ids, embed, stream, position_embeddings, causal,
             "mtp_logits": logits.cpu(), "mtp_argmax": argmax.cpu()}
 
 
+def restore_buffers(module, cls, config):
+    """to_empty() leaves non-persistent buffers (e.g. vision RoPE inv_freq) uninitialized; copy them
+    from a normally constructed instance."""
+    fresh = cls._from_config(config)
+    live = dict(module.named_buffers())
+    for name, buffer in fresh.named_buffers():
+        live[name].copy_(buffer.to(live[name].device, live[name].dtype))
+
+
+def multimodal_inputs(args, root, config, ckpt, device):
+    """Messages (CLI JSON, images included) -> ids, vision embeddings, mask, 3-axis positions.
+
+    The HF processor renders the checkpoint's chat template (thinking off, generation prompt) and
+    expands image placeholders; the checkpoint's own vision tower produces the embeddings and
+    Qwen4ExpModel.get_rope_index the Text MRoPE positions. `--generated` ids are appended.
+    """
+    from transformers import AutoProcessor
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpModel, Qwen4ExpVisionModel
+
+    processor = AutoProcessor.from_pretrained(root)
+    messages = json.loads(Path(args.messages).read_text())
+    for message in messages:
+        if isinstance(message.get("content"), list):
+            for part in message["content"]:
+                if part.get("type") == "image" and "image" in part:
+                    part["path"] = part.pop("image")
+    inputs = processor.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True, return_dict=True,
+        return_tensors="pt", enable_thinking=False)
+    prompt_ids = inputs["input_ids"]
+    generated = [int(x) for x in args.generated.split()] if args.generated else []
+    ids = torch.cat([prompt_ids, torch.tensor([generated], dtype=torch.long)], dim=1)
+    mm_types = torch.cat([inputs["mm_token_type_ids"],
+                          torch.zeros(1, len(generated), dtype=inputs["mm_token_type_ids"].dtype)], dim=1)
+    print(f"multimodal prompt: {prompt_ids.shape[1]} tokens, image grid {inputs['image_grid_thw'].tolist()}")
+
+    with torch.device("meta"):
+        vision = Qwen4ExpVisionModel._from_config(config.vision_config)
+    vision.to_empty(device=device)
+    vision.to(torch.bfloat16)
+    restore_buffers(vision, Qwen4ExpVisionModel, config.vision_config)
+    state = {name: ckpt.get("model.visual." + name).to(device, torch.bfloat16)
+             for name, _ in vision.named_parameters()}
+    missing, unexpected = vision.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(f"vision: missing={missing} unexpected={unexpected}")
+    vision.eval()
+    grid = inputs["image_grid_thw"].to(device)
+    out = vision(inputs["pixel_values"].to(device, torch.bfloat16), grid_thw=grid)
+    image_embeds = out.pooler_output if hasattr(out, "pooler_output") else out
+    if isinstance(image_embeds, (list, tuple)):
+        image_embeds = torch.cat(list(image_embeds), dim=0)
+    del vision
+    torch.cuda.empty_cache()
+
+    with torch.device("meta"):
+        shell = Qwen4ExpModel.__new__(Qwen4ExpModel)
+    torch.nn.Module.__init__(shell)
+    shell.config = config
+    shell.spatial_merge_size = config.vision_config.spatial_merge_size
+    position_ids, _ = Qwen4ExpModel.get_rope_index(shell, ids, mm_token_type_ids=mm_types,
+                                                   image_grid_thw=inputs["image_grid_thw"])
+    image_mask = ids[0] == config.image_token_id
+    if int(image_mask.sum()) != image_embeds.shape[0]:
+        raise RuntimeError(f"{int(image_mask.sum())} image tokens but {image_embeds.shape[0]} embeddings")
+    return ids[0], image_embeds, image_mask.to(device), position_ids, prompt_ids.shape[1]
+
+
+def report_generated(logits, ids, prompt_len):
+    """Teacher-forced check of the appended generation (same rows as compare_decode.py)."""
+    rows, agree = [], 0
+    for i, token in enumerate(ids[prompt_len:].tolist()):
+        row = logits[prompt_len - 1 + i]
+        top2 = row.topk(2)
+        best = int(top2.indices[0])
+        agree += best == token
+        rows.append({"step": i, "ninfer": token, "reference": best,
+                     "margin": round(float(top2.values[0] - top2.values[1]), 4),
+                     "ninfer_logit_gap": round(float(top2.values[0] - row[token]), 4)})
+    print(json.dumps(rows, indent=1))
+    print(f"prompt_tokens={prompt_len} generated={len(rows)} argmax_agreement={agree}/{len(rows)}")
+
+
 @torch.no_grad()
 def run(args):
     root = Path(args.checkpoint)
@@ -258,7 +341,12 @@ def run(args):
     device = torch.device(args.device)
     ckpt = Checkpoint(root)
 
-    if args.ids:
+    image_embeds = image_mask = position_ids_3d = None
+    prompt_len = None
+    if args.messages:
+        ids, image_embeds, image_mask, position_ids_3d, prompt_len = multimodal_inputs(
+            args, root, config, ckpt, device)
+    elif args.ids:
         ids = torch.tensor([int(x) for x in args.ids.split(",")], dtype=torch.long)
     else:
         from transformers import AutoTokenizer
@@ -274,11 +362,15 @@ def run(args):
 
     embed = ckpt.get(f"{TEXT_PREFIX}embed_tokens.weight").to(device)
     hidden = embed[ids[0]][None].to(torch.bfloat16)
+    if image_embeds is not None:
+        # Vision embeddings replace their placeholder tokens before the stream broadcast.
+        hidden[0][image_mask] = image_embeds.to(device, torch.bfloat16)
     if not args.mtp:
         del embed
 
     rotary = Qwen4ExpTextRotaryEmbedding(config=text).to(device)
-    position_ids = torch.arange(seq, device=device).view(1, 1, -1).expand(3, 1, -1)
+    position_ids = (position_ids_3d.to(device) if position_ids_3d is not None
+                    else torch.arange(seq, device=device).view(1, 1, -1).expand(3, 1, -1))
     position_embeddings = rotary(hidden, position_ids)
 
     causal = torch.tril(torch.ones(seq, seq, dtype=torch.bool, device=device))[None, None]
@@ -296,7 +388,8 @@ def run(args):
             past_key_values=None,
             ple_input_ids=ids,
         )
-        torch.cuda.synchronize(device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         if not args.nll_only:
             record["layers"].append(stream[0].cpu())
         print(f"layer {idx:2d} {text.layer_types[idx]:17s} load {t1 - t0:5.1f}s run {time.time() - t1:5.2f}s "
@@ -337,6 +430,8 @@ def run(args):
         return
     logits = torch.nn.functional.linear(final, lm_head).float()
     record["logits"] = logits[0].cpu()
+    if prompt_len is not None:
+        report_generated(logits[0], ids[0], prompt_len)
     logprobs = torch.log_softmax(logits[0], dim=-1)
     targets = ids[0, 1:]
     token_logprobs = logprobs[:-1].gather(1, targets[:, None]).squeeze(1)
@@ -359,6 +454,8 @@ def main():
     p.add_argument("--max-tokens", type=int, default=0)
     p.add_argument("--nll-only", action="store_true", help="save only per-token log-probs")
     p.add_argument("--mtp", action="store_true", help="also run the MTP draft head teacher-forced")
+    p.add_argument("--messages", help="CLI-style messages JSON (images allowed); multimodal input")
+    p.add_argument("--generated", default="", help="space-separated NInfer ids appended to --messages")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--out", default="ref.pt")
     run(p.parse_args())

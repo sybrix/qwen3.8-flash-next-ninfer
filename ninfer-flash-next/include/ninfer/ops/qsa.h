@@ -27,7 +27,8 @@ namespace ninfer::ops {
  */
 
 /// Index queries: out[:,h,c] = BF16(RoPE_{pos(c)}(BF16(RMSNorm(q[:,h,c]; weight)))).
-/// `q`/`out` contiguous BF16 [Di,Hi,W,B]; weight BF16 [Di].
+/// `q`/`out` contiguous BF16 [Di,Hi,W,B]; weight BF16 [Di]. `positions` are the RoPE positions of
+/// the columns: I32 [W*B] (1-D) or [W*B,3] axis-major Text MRoPE, where pair i uses axis i%3.
 void qsa_prepare_query(const Tensor& q, const Tensor& weight, const Tensor& positions,
                        std::int32_t rotary_dim, float theta, float eps, Tensor& out,
                        cudaStream_t stream);
@@ -35,6 +36,14 @@ void qsa_prepare_query(const Tensor& q, const Tensor& weight, const Tensor& posi
 /// Writes raw index keys `keys` (contiguous BF16 [Di,W,B]) to the slots of their positions.
 void qsa_index_append(const Tensor& keys, const Tensor& positions, const Tensor& rows,
                       const Tensor& index_pages, const Tensor& block_tables, cudaStream_t stream);
+
+/// Also records each column's RoPE position (rope_positions I32 [W*B] or [W*B,3]) into
+/// `position_pages` (I32 [4,64,1,pages]: three axes and a zero pad, sharing the block tables), so
+/// qsa_select can rotate pooled blocks with their first token's multimodal position.
+void qsa_index_append(const Tensor& keys, const Tensor& positions, const Tensor& rows,
+                      const Tensor& index_pages, const Tensor& block_tables,
+                      const Tensor& rope_positions, const Tensor& position_pages,
+                      cudaStream_t stream);
 
 struct QsaSelectGeometry {
     std::int32_t compress_ratio = 4;    // tokens per pooled block
@@ -71,6 +80,15 @@ struct QsaSelectGeometry {
 /// `max_visible` bounds every column's p+1 and fixes the launch shape (CUDA Graph stable).
 void qsa_select(const Tensor& query, const Tensor& positions, const Tensor& rows,
                 const Tensor& index_pages, const Tensor& block_tables, const Tensor& key_norm,
+                const QsaSelectGeometry& geometry, std::int32_t max_visible,
+                WorkspaceArena& workspace, Tensor& selected, Tensor& counts, cudaStream_t stream);
+
+/// Multimodal form: pooled block b rotates with the recorded RoPE position of token bR from
+/// `position_pages` (see qsa_index_append) instead of the 1-D position bR. `positions` stay the
+/// columns' cache positions (visibility). The form above is this one with no position pages.
+void qsa_select(const Tensor& query, const Tensor& positions, const Tensor& rows,
+                const Tensor& index_pages, const Tensor& position_pages,
+                const Tensor& block_tables, const Tensor& key_norm,
                 const QsaSelectGeometry& geometry, std::int32_t max_visible,
                 WorkspaceArena& workspace, Tensor& selected, Tensor& counts, cudaStream_t stream);
 

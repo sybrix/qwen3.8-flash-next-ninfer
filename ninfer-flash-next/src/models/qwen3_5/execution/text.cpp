@@ -430,9 +430,9 @@ void TextContext::mtp_forward_core(const Tensor& ids, const Tensor& hidden, cons
     if (qwen4_exp()) {
         const int T = static_cast<int>(ids.numel());
         ScopedPositions cache_binding(active_cache_positions_, positions);
-        // Qwen4Exp Text RoPE is 1-D; a three-axis [T,3] binding carries it on axis 0.
+        // Multimodal bindings keep all three Text MRoPE axes ([T,3]); otherwise 1-D [T].
         Tensor rope_flat = rope_positions.numel() == 3 * static_cast<std::int64_t>(T)
-                               ? rope_positions.slice(1, 0, 1).view({T})
+                               ? rope_positions.view({T, 3})
                                : rope_positions.view({T});
         ScopedPositions rope_binding(active_rope_positions_, rope_flat);
         ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
@@ -487,9 +487,9 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor streams = work_.alloc(DType::BF16, {carried_width(), T});
         {
             ScopedPositions cache_binding(active_cache_positions_, positions);
-            // Qwen4Exp Text RoPE is 1-D; a three-axis [T,3] binding carries it on axis 0.
+            // Multimodal bindings keep all three Text MRoPE axes ([T,3]); otherwise 1-D [T].
         Tensor rope_flat = rope_positions.numel() == 3 * static_cast<std::int64_t>(T)
-                               ? rope_positions.slice(1, 0, 1).view({T})
+                               ? rope_positions.view({T, 3})
                                : rope_positions.view({T});
             ScopedPositions rope_binding(active_rope_positions_, rope_flat);
             ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
@@ -1341,11 +1341,26 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             Tensor x = roots.residual;
             Tensor ple_rows;
             std::optional<ScopedValue<const Tensor*>> ple_binding;
+            // Vision embeddings replace their placeholder tokens' embeddings. Qwen4Exp scatters
+            // them into the [H,T] token embedding before it is broadcast to the S streams.
+            Tensor scatter_indices;
+            Tensor visual_embeddings;
+            if (!local_scatter_indices.empty()) {
+                scatter_indices = roots.scatter_indices;
+                copy_i32(local_scatter_indices.data(), scatter_indices, s);
+                visual_embeddings = vision_chunk.embeddings.slice(
+                    1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
+            }
             if (qwen4_exp()) {
-                if (multimodal != nullptr || text_prefill == nullptr) {
-                    throw std::logic_error("Qwen4Exp prefill currently accepts Text prompts only");
+                if (multimodal == nullptr && text_prefill == nullptr) {
+                    throw std::logic_error("Qwen4Exp prefill requires its prompt token ids");
                 }
-                qwen4_exp_embed(ids_device, x);
+                const std::span<const int> prompt_ids =
+                    multimodal != nullptr ? std::span<const int>(multimodal->token_ids)
+                                          : std::span<const int>(text_prefill->token_ids);
+                qwen4_exp_embed(ids_device, x,
+                                visual_embeddings.data != nullptr ? &visual_embeddings : nullptr,
+                                visual_embeddings.data != nullptr ? &scatter_indices : nullptr);
                 if (config_.ple) {
                     const std::size_t column = config_.ple->embed_dim;
                     const std::size_t bytes  = column * static_cast<std::size_t>(len);
@@ -1357,7 +1372,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                            .qwen4_exp->ple;
                     // The staging buffer is reused per chunk; the previous chunk ended in a
                     // device synchronization, so its upload has completed.
-                    gather_ple_rows(ple, *config_.ple, text_prefill->token_ids,
+                    gather_ple_rows(ple, *config_.ple, prompt_ids,
                                     static_cast<std::size_t>(prompt_t0),
                                     static_cast<std::size_t>(len), ple_staging_);
                     ple_rows = work_.alloc(DType::FP8_E4M3FN, {dimension(column), len});
@@ -1367,13 +1382,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
             } else {
                 ops::embedding(ids_device, *embed_, x, s);
-            }
-            if (!local_scatter_indices.empty()) {
-                Tensor indices_device = roots.scatter_indices;
-                copy_i32(local_scatter_indices.data(), indices_device, s);
-                Tensor embeddings = vision_chunk.embeddings.slice(
-                    1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
-                ops::scatter(embeddings, indices_device, x, s);
+                if (visual_embeddings.data != nullptr) {
+                    ops::scatter(visual_embeddings, scatter_indices, x, s);
+                }
             }
             if constexpr (Tap::enabled) { tap.begin(x); }
             run_layers(x, Phase::Prefill, tap);
@@ -1582,13 +1593,15 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData&
 
 // ---- Qwen4Exp hyper-connection path (docs/maintainer/qwen4_exp-model.md) -------------------
 
-void TextContext::qwen4_exp_embed(const Tensor& ids, Tensor& x) {
+void TextContext::qwen4_exp_embed(const Tensor& ids, Tensor& x, const Tensor* visual,
+                                  const Tensor* visual_indices) {
     const auto& hc       = *config_.hyper_connection;
     const std::int32_t h = dimension(config_.hidden_size);
     const std::int32_t t = ids.ne[0];
     cudaStream_t s       = ctx_.stream;
     Tensor embedded      = work_.alloc(DType::BF16, {h, t});
     ops::embedding(ids, *embed_, embedded, s);
+    if (visual != nullptr) { ops::scatter(*visual, *visual_indices, embedded, s); }
     // Every stream starts as the token embedding. Kernel form (zero, then a unit-weight
     // injection, which is exact) keeps CUDA Graph updates legal across workspace layouts.
     if (qwen4_runtime_ != nullptr && qwen4_runtime_->stream_ones.ne[1] >= t) {
@@ -1683,9 +1696,12 @@ void TextContext::qwen4_exp_attention(const Qwen4ExpAttentionParameters& p, cons
     Tensor ik_flat     = index_key.view({di, T});
     project(u, p.index_query, iq_flat, work_, s);
     project(u, p.index_key, ik_flat, work_, s);
-    ops::qsa_index_append(index_key, positions_batch, kv_table_rows,
-                          kv_cache.index_pages(fidx),
-                          kv_cache.block_tables(), s);
+    // QSA rotates with the columns' RoPE positions ([T] or multimodal [T,3]); layer 0 records them
+    // per token so later selections rotate pooled blocks with their first token's position.
+    const Tensor qsa_rope = rope_for_op;
+    const Tensor position_pages = fidx == 0 ? kv_cache.rope_position_pages() : Tensor{};
+    ops::qsa_index_append(index_key, positions_batch, kv_table_rows, kv_cache.index_pages(fidx),
+                          kv_cache.block_tables(), qsa_rope, position_pages, s);
 
     const bool sparse =
         active_causal_attention_envelope_->max_visible_keys > qsa.dense_equivalent_extent();
@@ -1719,13 +1735,13 @@ void TextContext::qwen4_exp_attention(const Qwen4ExpAttentionParameters& p, cons
             .theta          = config_.rope_parameters->rope_theta,
             .eps            = config_.rms_norm_eps};
         Tensor prepared = work_.alloc(DType::BF16, {di, ih, width, batch});
-        ops::qsa_prepare_query(index_query, p.index_query_norm, positions_batch,
+        ops::qsa_prepare_query(index_query, p.index_query_norm, qsa_rope,
                                geometry.rotary_dim, geometry.theta, geometry.eps, prepared, s);
         Tensor selected = work_.alloc(DType::I32, {geometry.max_selected(), width, batch});
         Tensor counts   = work_.alloc(DType::I32, {width, batch});
-        ops::qsa_select(prepared, positions_batch, kv_table_rows,
-                        kv_cache.index_pages(fidx),
-                        kv_cache.block_tables(), p.index_key_norm, geometry,
+        ops::qsa_select(prepared, positions_batch, kv_table_rows, kv_cache.index_pages(fidx),
+                        kv_cache.rope_position_pages(), kv_cache.block_tables(), p.index_key_norm,
+                        geometry,
                         static_cast<std::int32_t>(
                             active_causal_attention_envelope_->max_visible_keys),
                         work_, selected, counts, s);

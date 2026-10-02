@@ -668,6 +668,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             matrix(mtp_prefill, DType::FP8_E4M3FN, dimension(config.ple->embed_dim), chunk);
         }
         matrix(mtp_prefill, DType::I32, 1, chunk);
+        if (plan.features.vision) {
+            // Multimodal MTP input embeddings and their shifted visual scatter indices.
+            matrix(mtp_prefill, DType::BF16, h, chunk);
+            (void)workspace::visual_scatter_indices(mtp_prefill, chunk);
+        }
         {
             auto call = mtp_prefill.scope();
             matrix(mtp_prefill, DType::BF16, carried, chunk);
@@ -991,9 +996,9 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
                 "Qwen4Exp contexts beyond " + std::to_string(text.qsa->dense_equivalent_extent()) +
                 " tokens require bf16 or fp8 KV");
         }
-        if (options.enable_vision || (options.speculative.backend != SpeculativeBackend::None &&
-                                      options.speculative.backend != SpeculativeBackend::Mtp)) {
-            throw std::invalid_argument("Qwen4Exp supports Text with optional MTP speculation");
+        if (options.speculative.backend != SpeculativeBackend::None &&
+            options.speculative.backend != SpeculativeBackend::Mtp) {
+            throw std::invalid_argument("Qwen4Exp supports MTP speculation only");
         }
         if (options.speculative.backend == SpeculativeBackend::Mtp &&
             options.speculative.proposal_head != ProposalHead::Full) {

@@ -12,7 +12,10 @@ from pathlib import Path
 from typing import Mapping
 
 from .model import Model, Parameter
+from .sources.logical import LogicalSource
+import torch
 from .qwen3_5 import _Builder, _fixed, _positive, text_config as qwen3_5_text_config
+from .qwen3_5 import vision_config as qwen3_5_vision_config
 from .resources import load_resources
 from .sources.safetensors import SafetensorsSource, tensor_source
 
@@ -254,8 +257,8 @@ def build_model(
     resource_overrides: Mapping[str, str | Path] | None = None,
 ) -> Model:
     selected = tuple(components)
-    if selected not in (("text",), ("text", "mtp")):
-        raise ValueError("Qwen4Exp conversion provides text or text,mtp")
+    if not selected or selected[0] != "text" or not set(selected) <= {"text", "mtp", "vision"}:
+        raise ValueError("Qwen4Exp conversion provides text plus optional mtp and vision")
     config = text_config(base.config)
     records = {"text": {"config": config}}
     mtp = "mtp" in selected
@@ -266,10 +269,18 @@ def build_model(
         ]:
             raise ValueError("Qwen4Exp MTP requires one full-attention layer")
         records["mtp"] = {"config": {"architectures": ["Qwen4ExpMTP"]}, "target": "text"}
+    vision = "vision" in selected
+    if vision:
+        # The vision tower and its 3-axis RoPE positions are exactly Qwen3.5's (transformers
+        # qwen4_exp vs qwen3_5 vision modules are identical).
+        records["vision"] = {
+            "config": qwen3_5_vision_config(base.config, config),
+            "target": "text",
+        }
     refs, resources, count, special = load_resources(
         base.root,
         vocab_size=config["vocab_size"],
-        vision_config=None,
+        vision_config=records["vision"]["config"] if vision else None,
         overrides=resource_overrides,
     )
     for component, resource_refs in refs.items():
@@ -313,7 +324,53 @@ def build_model(
         builder.gated_residual(
             "mtp/final_residual/", "mtp.hyper_connection_mixer.", base, config, inject=False
         )
+    if vision:
+        vision_config = records["vision"]["config"]
+        builder.vision(base, vision_config, h)
+        _pad_vision_mlp(model, vision_config)
     return model
+
+
+# Vision MLP width 4304 is not a multiple of the Q8 group (32) or the BF16 K tile (64). Zero
+# padding to 4352 is exact (fc1 rows and bias are 0, GELU(0) = 0, the matching fc2 columns are 0)
+# and lets every Vision projection run at Q8, which keeps the image embeddings within ~6% of BF16
+# where the Qwen3.5 Q4/Q5 Vision recipe moves them ~35%.
+VISION_MLP_PADDED = 4352
+
+
+def _padded_source(source: LogicalSource, shape: tuple[int, ...]) -> LogicalSource:
+    original = source.shape
+    cache: dict[str, torch.Tensor] = {}
+
+    def values() -> torch.Tensor:
+        if "v" not in cache:
+            padded = torch.zeros(shape, dtype=torch.float32)
+            data = source.values().reshape(original).to(torch.float32)
+            padded[tuple(slice(0, n) for n in original)] = data
+            cache["v"] = padded.reshape(-1)
+        return cache["v"]
+
+    return LogicalSource(shape, f"{source.label} (zero-padded to {shape})",
+                         lambda begin, end: values()[begin:end])
+
+
+def _pad_vision_mlp(model: Model, config: dict) -> None:
+    width, padded = config["intermediate_size"], VISION_MLP_PADDED
+    if width > padded:
+        raise ValueError("Vision MLP is wider than its padded width")
+    for layer in range(config["depth"]):
+        prefix = f"vision/layers/{layer}/mlp/"
+        for role, shape in (("fc1", (padded, config["hidden_size"])), ("fc1_bias", (padded,)),
+                            ("fc2", (config["hidden_size"], padded))):
+            old = model.parameters[prefix + role]
+            def factory(selected, format=None, old=old, shape=shape):
+                if format is not None:
+                    raise ValueError(f"{old.name}: padded Vision MLP takes values only")
+                return _padded_source(old.source_factory(selected), shape)
+            model.parameters[prefix + role] = Parameter(
+                old.name, shape, _padded_source(old.source, shape), factory, old.inputs,
+                old.direct_format, residency=old.residency)
+    config["intermediate_size"] = padded
 
 
 def is_qwen4_exp(source: SafetensorsSource) -> bool:

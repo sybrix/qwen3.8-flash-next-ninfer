@@ -84,11 +84,13 @@ def main():
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--lm-head-std", type=float, default=0.02)
     p.add_argument("--mtp", action="store_true", help="add the MTP head (FP8_PB_WO experts)")
+    p.add_argument("--vision", action="store_true", help="add the (Qwen3.5-shaped) vision tower")
     args = p.parse_args()
     src, out = Path(args.source), Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     for name in ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt",
-                 "chat_template.jinja", "generation_config.json"):
+                 "chat_template.jinja", "generation_config.json", "preprocessor_config.json",
+                 "video_preprocessor_config.json"):
         if (src / name).exists():
             shutil.copy(src / name, out / name)
     config = json.loads((src / "config.json").read_text())
@@ -199,6 +201,36 @@ def main():
         if i != n - 1:
             shards.append(dict(tensors))
             tensors = {}
+    if args.vision:
+        shards.append(tensors)
+        tensors = {}
+        vc = config["vision_config"]
+        vh, vi, depth = vc["hidden_size"], vc["intermediate_size"], vc["depth"]
+        ps, pt, merge = vc["patch_size"], vc["temporal_patch_size"], vc["spatial_merge_size"]
+        out_h, mh = vc["out_hidden_size"], vh * merge * merge
+        v = "model.visual."
+        tensors[v + "patch_embed.proj.weight"] = bf16((vh, 3, pt, ps, ps), 0.02, gen)
+        tensors[v + "patch_embed.proj.bias"] = bf16((vh,), 0.02, gen)
+        tensors[v + "pos_embed.weight"] = bf16((vc["num_position_embeddings"], vh), 0.02, gen)
+        for i in range(depth):
+            b = f"{v}blocks.{i}."
+            for norm in ("norm1", "norm2"):
+                tensors[b + norm + ".weight"] = (1.0 + torch.randn(vh, generator=gen) * 0.05).to(torch.bfloat16)
+                tensors[b + norm + ".bias"] = bf16((vh,), 0.02, gen)
+            tensors[b + "attn.qkv.weight"] = bf16((3 * vh, vh), 0.02, gen)
+            tensors[b + "attn.qkv.bias"] = bf16((3 * vh,), 0.02, gen)
+            tensors[b + "attn.proj.weight"] = bf16((vh, vh), 0.02, gen)
+            tensors[b + "attn.proj.bias"] = bf16((vh,), 0.02, gen)
+            tensors[b + "mlp.linear_fc1.weight"] = bf16((vi, vh), 0.02, gen)
+            tensors[b + "mlp.linear_fc1.bias"] = bf16((vi,), 0.02, gen)
+            tensors[b + "mlp.linear_fc2.weight"] = bf16((vh, vi), 0.02, gen)
+            tensors[b + "mlp.linear_fc2.bias"] = bf16((vh,), 0.02, gen)
+        tensors[v + "merger.norm.weight"] = (1.0 + torch.randn(vh, generator=gen) * 0.05).to(torch.bfloat16)
+        tensors[v + "merger.norm.bias"] = bf16((vh,), 0.02, gen)
+        tensors[v + "merger.linear_fc1.weight"] = bf16((mh, mh), 0.02, gen)
+        tensors[v + "merger.linear_fc1.bias"] = bf16((mh,), 0.02, gen)
+        tensors[v + "merger.linear_fc2.weight"] = bf16((out_h, mh), 0.02, gen)
+        tensors[v + "merger.linear_fc2.bias"] = bf16((out_h,), 0.02, gen)
     if args.mtp:
         shards.append(tensors)
         tensors = {}

@@ -193,7 +193,10 @@ private:
 
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     // Qwen4Exp hyper-connection path; `x` is the [S*H,T] residual stream.
-    void qwen4_exp_embed(const Tensor& ids, Tensor& x);
+    // Optional `visual` [H,V] embeddings replace columns `visual_indices` (I32 [V]) of the token
+    // embedding before it is broadcast to the streams.
+    void qwen4_exp_embed(const Tensor& ids, Tensor& x, const Tensor* visual = nullptr,
+                         const Tensor* visual_indices = nullptr);
     void qwen4_exp_layers(Tensor& x, Phase phase);
     void qwen4_exp_gated_residual(const GatedResidualParameters& p, const Tensor& x, Tensor& mixed,
                                   Tensor* inject);

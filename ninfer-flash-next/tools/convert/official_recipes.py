@@ -23,22 +23,29 @@ def _assign(recipe, name, format, *, source=None):
     recipe.assign(name, format=format, method=method, source=source)
 
 
+def _vision_format(name):
+    if name == "vision/patch_embedding":
+        return Q6
+    if name.startswith("vision/merger/"):
+        return Q8
+    if name.endswith(("/attention/query", "/attention/key", "/attention/value", "/mlp/fc1")):
+        return Q4
+    return Q5
+
+
+def _vision(model, recipe):
+    for name, parameter in model.parameters.items():
+        if parameter.projection and name.startswith("vision/"):
+            _assign(recipe, name, _vision_format(name))
+
+
 def _optional(model, recipe):
+    _vision(model, recipe)
     for name, parameter in model.parameters.items():
         if not parameter.projection:
             continue
         if name.startswith("vision/"):
-            if name == "vision/patch_embedding":
-                format = Q6
-            elif name.startswith("vision/merger/"):
-                format = Q8
-            elif name.endswith(
-                ("/attention/query", "/attention/key", "/attention/value", "/mlp/fc1")
-            ):
-                format = Q4
-            else:
-                format = Q5
-            _assign(recipe, name, format)
+            continue
         elif name.startswith(("mtp/", "dflash/", "dflash2/")):
             if name.endswith(
                 (
@@ -212,6 +219,12 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
                     ),
                 )
             recipe.group(names, shape=(experts, *shape))
+    # The vision tower is the Qwen3.5 one with its MLP zero-padded to 4352 (see qwen4_exp.py); every
+    # Vision projection runs at Q8 (the Qwen3.5 Q4/Q5 mix moves image embeddings ~35%).
+    if "vision" in model.components:
+        for name, parameter in model.parameters.items():
+            if parameter.projection and name.startswith("vision/"):
+                _assign(recipe, name, Q8)
     if "mtp" not in model.components:
         return
     # The MTP experts ship as FP8_PB_WO (128x128 block multipliers); re-encode them as

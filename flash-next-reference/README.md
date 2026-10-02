@@ -7,10 +7,10 @@ implementation. They also exercised the real server.
 
 | Script | Purpose |
 |---|---|
-| `flashnext_ref.py` | Layer-streaming PyTorch reference. It runs the official `transformers` `qwen4_exp` modules one decoder layer at a time from the NVFP4 checkpoint, so the 130 GB model never has to be resident. Routed experts are dequantized to BF16, and the n-gram table is gathered row by row from the memory-mapped FP8 shards. Outputs per-layer streams, logits, NLL and argmax. `--nll-only` runs long contexts in bounded memory; `--mtp` also runs the MTP draft head teacher-forced. That head follows SGLang's `Qwen4ExpForCausalLMMTP`, because `transformers` skips the MTP weights. |
+| `flashnext_ref.py` | Layer-streaming PyTorch reference. It runs the official `transformers` `qwen4_exp` modules one decoder layer at a time from the NVFP4 checkpoint, so the 130 GB model never has to be resident. Routed experts are dequantized to BF16, and the n-gram table is gathered row by row from the memory-mapped FP8 shards. Outputs per-layer streams, logits, NLL and argmax. `--nll-only` runs long contexts in bounded memory; `--mtp` also runs the MTP draft head teacher-forced. That head follows SGLang's `Qwen4ExpForCausalLMMTP`, because `transformers` skips the MTP weights. `--messages` takes CLI-style messages with images. The HF processor renders them, the checkpoint's vision tower embeds the images, and `get_rope_index` supplies 3-axis positions. `--generated` appends NInfer's tokens for a teacher-forced check. |
 | `compare_decode.py` | Teacher-forces a NInfer generation through the reference. For each step it reports whether NInfer's token is the reference argmax, and the reference margin, so real errors can be told apart from near-ties. |
 | `e2e_decode.sh` | Greedy-decodes with the NInfer CLI, then runs `compare_decode.py` on the result. |
-| `gen_synthetic.py` | Writes a synthetic 4-layer checkpoint with the real per-layer shapes: 512 NVFP4 experts, hyper-connections, the PLE table and, with `--mtp`, an FP8-block MTP head. Fast end-to-end tests run on it without loading the full model. |
+| `gen_synthetic.py` | Writes a synthetic 4-layer checkpoint with the real per-layer shapes: 512 NVFP4 experts, hyper-connections, the PLE table, with `--mtp` an FP8-block MTP head, and with `--vision` the full-size vision tower. Fast end-to-end tests run on it without loading the full model. |
 
 ## Server and integration tests
 
@@ -21,6 +21,8 @@ implementation. They also exercised the real server.
 | `mtp_real_test.sh` | Real-model MTP benchmark: perplexity sanity check, then decode speed and acceptance at K=1/2/3 at short and ~8K context, then greedy agreement with non-speculative output. It stops the production server and always restarts it on exit, and refuses to start unless the artifact is a single complete file. |
 | `swap_mtp_test.sh` | Swaps the server to Flash-Next, sends OpenAI, Anthropic, long-context and concurrent requests, then swaps back. |
 | `cold_prefill_test.sh` | Drops the OS page cache and measures cold-cache prompt latency on the server. |
+| `vision_real_test.sh` | Real-model vision benchmark: image prompts (a chart, and a photo plus ~3K tokens of text) with and without MTP, then teacher-forced reference checks. It restores whichever model was serving. |
+| `vision_quant_check.py` | Measures how far a vision-weight quantization recipe moves real image embeddings from BF16, for any Qwen3.5-family checkpoint. |
 
 ## Usage notes
 

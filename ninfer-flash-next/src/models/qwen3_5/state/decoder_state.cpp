@@ -48,6 +48,9 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     for (std::uint32_t layer = 0; index_head_dim > 0 && layer < layers; ++layer) {
         geometry.planes.push_back({DType::BF16, index_head_dim, 1, 256});
     }
+    // One layer-independent plane of per-token RoPE positions (three Text MRoPE axes + pad) that
+    // QSA uses to rotate pooled blocks; it moves with the pages like every other plane.
+    if (index_head_dim > 0) { geometry.planes.push_back({DType::I32, 4, 1, 256}); }
     return PagedKVCacheLayout{
         .pages = plan_device_kv_page_pool(
             builder, DeviceKVPagePoolSpec{.page_group_count = physical_page_groups,
@@ -84,7 +87,8 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
       layer_storage_(layout.layer_storage), index_head_dim_(layout.index_head_dim) {
     if (pages_.plane_count() !=
         static_cast<std::size_t>(layers_) *
-            (layer_storage_.planes_per_layer() + (index_head_dim_ > 0 ? 1U : 0U))) {
+                (layer_storage_.planes_per_layer() + (index_head_dim_ > 0 ? 1U : 0U)) +
+            (index_head_dim_ > 0 ? 1U : 0U)) {
         throw std::invalid_argument("Paged KV layer plane inventory is inconsistent");
     }
 }
@@ -147,6 +151,12 @@ Tensor PagedKVCache::index_pages(std::uint32_t layer) const {
     }
     return pages_.plane(static_cast<std::size_t>(layers_) * layer_storage_.planes_per_layer() +
                         layer);
+}
+
+Tensor PagedKVCache::rope_position_pages() const {
+    if (index_head_dim_ <= 0) { throw std::out_of_range("Paged KV has no RoPE position plane"); }
+    return pages_.plane(static_cast<std::size_t>(layers_) *
+                        (layer_storage_.planes_per_layer() + 1U));
 }
 
 const Tensor& PagedKVCache::block_tables() const { return execution_tables_.matrix(); }

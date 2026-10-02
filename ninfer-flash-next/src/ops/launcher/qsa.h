@@ -17,6 +17,7 @@ void qsa_prepare_query_launch(const Tensor& q, const Tensor& weight, const Tenso
                               cudaStream_t stream);
 void qsa_index_append_launch(const Tensor& keys, const Tensor& positions, const Tensor& rows,
                              const Tensor& index_pages, const Tensor& block_tables,
+                             const Tensor& rope_positions, const Tensor& position_pages,
                              cudaStream_t stream);
 [[nodiscard]] std::size_t qsa_select_workspace_launch_bytes(std::int32_t ratio,
                                                             std::int32_t index_dim,
@@ -24,7 +25,8 @@ void qsa_index_append_launch(const Tensor& keys, const Tensor& positions, const 
                                                             std::int32_t columns,
                                                             std::int32_t max_visible);
 void qsa_select_launch(const Tensor& query, const Tensor& positions, const Tensor& rows,
-                       const Tensor& index_pages, const Tensor& block_tables,
+                       const Tensor& index_pages, const Tensor& position_pages,
+                       const Tensor& block_tables,
                        const Tensor& key_norm, std::int32_t ratio, std::int32_t budget,
                        std::int32_t rotary_dim, float theta, float eps, std::int32_t max_visible,
                        void* workspace, Tensor& selected, Tensor& counts, cudaStream_t stream);

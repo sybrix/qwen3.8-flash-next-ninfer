@@ -4,8 +4,8 @@
 #
 # This is the experimental port on branch `flash-next` in the worktree
 # ~/Projects/ninfer-flash-next — NOT the production checkout ~/Projects/ninfer
-# that start-ninfer.sh / ninfer.service run. Text with MTP speculative decoding;
-# Vision and DFlash are rejected for this architecture.
+# that start-ninfer.sh / ninfer.service run. Text + images (--vision) with MTP
+# speculative decoding; DFlash is rejected for this architecture.
 #
 # Normally you do not run this directly; use ./swap-model.sh flash-next, which
 # stops the 27B service first and waits for this server to come up.
@@ -29,6 +29,12 @@
 #     (QSA), which requires bf16 or fp8 KV.
 # --kv-dtype fp8
 #     Same as the 27B config. Validated: perplexity within 0.1% of bf16 at 8K.
+# --vision
+#     Image input (the Qwen3.5 vision tower; artifact converted with --components
+#     text,mtp,vision, vision projections at Q8). Like the 27B, residency is fixed at
+#     startup: without this flag every image request fails with HTTP 400
+#     "vision_disabled". Validated 2026-10-01 against the PyTorch reference (chart 121/128,
+#     image + 3K text 88/96 teacher-forced tokens, mismatches near-ties).
 # --spec mtp --draft-tokens 3
 #     The model's own one-layer MTP draft head (artifact converted with --components text,mtp;
 #     its FP8 experts re-encoded as NVFP4). Measured 2026-10-01: decode 77 -> 170 tok/s on a
@@ -48,7 +54,7 @@ set -u
 
 NINFER_DIR="${FLASH_NEXT_DIR:-$HOME/Projects/ninfer-flash-next}"
 SERVE_BIN="${NINFER_DIR}/build/apps/ninfer-serve"
-MODEL="${NINFER_DIR}/models/qwen3_8_flash_next_nvfp4_mtp.ninfer"
+MODEL="${NINFER_DIR}/models/qwen3_8_flash_next_nvfp4_mtp_vision.ninfer"
 MODEL_ID="qwen3.8-flash-next"
 HOST="0.0.0.0"
 PORT="8000"
@@ -88,6 +94,7 @@ cd "$NINFER_DIR" || exit 1
 CMD=("$SERVE_BIN" "$MODEL"
      --host "$HOST" --port "$PORT"
      --model-id "$MODEL_ID"
+     --vision
      --max-context 262144
      --kv-capacity 262144
      --max-concurrency 2

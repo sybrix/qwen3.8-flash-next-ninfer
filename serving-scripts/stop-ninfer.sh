@@ -62,6 +62,8 @@ pids() {
     for pid in $(pgrep -f "$PATTERN" 2>/dev/null); do
         [ "$pid" = "$$" ] && continue
         exe=$(readlink -f "/proc/${pid}/exe" 2>/dev/null) || continue
+        # A server started before a rebuild runs a replaced binary: "<path> (deleted)".
+        exe=${exe% (deleted)}
         # Accept the configured build, or any binary actually named ninfer-serve
         # (a differently-located build still counts).
         case "$exe" in

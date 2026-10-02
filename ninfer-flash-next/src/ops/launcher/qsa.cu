@@ -31,6 +31,7 @@ constexpr int kSelectThreads = 512;
 constexpr int kAttnTile      = 32;
 constexpr int kAttnHeadDim   = 256;
 constexpr int kMaxGroup      = 16;
+constexpr int kPositionSlots = 4; // three RoPE axes, padded
 
 __device__ __forceinline__ float bf(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 
@@ -43,10 +44,27 @@ __device__ __forceinline__ void rope_coefficients(int pair, int rotary_dim, floa
     s                    = bf(sinf(angle));
 }
 
+// Text MRoPE positions of one token: pair i rotates with axis i%3 (Qwen3.5/Qwen4Exp interleaved
+// sections [11,11,10] over 32 pairs). Text tokens carry three equal axes, which is 1-D RoPE.
+struct AxisPositions {
+    std::int64_t axis[3];
+};
+
+__device__ __forceinline__ AxisPositions uniform_axes(std::int64_t position) {
+    return {{position, position, position}};
+}
+
+// Rope positions are I32 [T] (one axis) or [T,3] axis-major (element (t,a) at a*T+t).
+__device__ __forceinline__ AxisPositions token_axes(const std::int32_t* rope, int axes,
+                                                    int tokens, int t) {
+    if (axes == 1) return uniform_axes(rope[t]);
+    return {{rope[t], rope[tokens + t], rope[2 * tokens + t]}};
+}
+
 // Normalizes and rotates one Di-vector held in shared memory `v` (FP32, already BF16-valued).
 // Called by one warp; writes BF16 results to `out`.
 __device__ void norm_rope_vector(float* v, int di, const __nv_bfloat16* weight, float eps,
-                                 std::int64_t position, int rotary_dim, float theta,
+                                 AxisPositions position, int rotary_dim, float theta,
                                  __nv_bfloat16* out) {
     const int lane = threadIdx.x & 31;
     float sum      = 0.0f;
@@ -63,7 +81,7 @@ __device__ void norm_rope_vector(float* v, int di, const __nv_bfloat16* weight, 
         if (d < rotary_dim) {
             const int pair = d < half ? d : d - half;
             float c, s;
-            rope_coefficients(pair, rotary_dim, theta, position, c, s);
+            rope_coefficients(pair, rotary_dim, theta, position.axis[pair % 3], c, s);
             const float rotated = d < half ? -v[d + half] : v[d - half];
             result              = bf(bf(v[d] * c) + bf(rotated * s));
         }
@@ -73,9 +91,9 @@ __device__ void norm_rope_vector(float* v, int di, const __nv_bfloat16* weight, 
 
 __global__ void prepare_query_kernel(const __nv_bfloat16* __restrict__ q,
                                      const __nv_bfloat16* __restrict__ weight,
-                                     const std::int32_t* __restrict__ positions, int di, int heads,
-                                     int vectors, int rotary_dim, float theta, float eps,
-                                     __nv_bfloat16* __restrict__ out) {
+                                     const std::int32_t* __restrict__ positions, int axes,
+                                     int di, int heads, int vectors, int rotary_dim, float theta,
+                                     float eps, __nv_bfloat16* __restrict__ out) {
     __shared__ float stage[8][kMaxIndexD];
     const int warp   = threadIdx.x >> 5;
     const int vector = blockIdx.x * 8 + warp;
@@ -84,7 +102,8 @@ __global__ void prepare_query_kernel(const __nv_bfloat16* __restrict__ q,
     float* v         = stage[warp];
     for (int d = threadIdx.x & 31; d < di; d += 32) v[d] = __bfloat162float(q[vector * di + d]);
     __syncwarp();
-    norm_rope_vector(v, di, weight, eps, positions[column], rotary_dim, theta, out + vector * di);
+    norm_rope_vector(v, di, weight, eps, token_axes(positions, axes, vectors / heads, column),
+                     rotary_dim, theta, out + vector * di);
 }
 
 __device__ __forceinline__ std::int64_t index_slot(const std::int32_t* block_tables,
@@ -98,13 +117,20 @@ __global__ void index_append_kernel(const __nv_bfloat16* __restrict__ keys,
                                     const std::int32_t* __restrict__ rows,
                                     const std::int32_t* __restrict__ block_tables,
                                     int logical_pages, int di, int width,
-                                    __nv_bfloat16* __restrict__ pages) {
+                                    __nv_bfloat16* __restrict__ pages,
+                                    const std::int32_t* __restrict__ rope, int axes, int tokens,
+                                    std::int32_t* __restrict__ position_pages) {
     const int column = blockIdx.x;
     const int row    = rows[column / width];
     const std::int64_t slot =
         index_slot(block_tables, logical_pages, row, positions[column]);
     for (int d = threadIdx.x; d < di; d += blockDim.x) {
         pages[slot * di + d] = keys[static_cast<std::int64_t>(column) * di + d];
+    }
+    if (position_pages != nullptr && threadIdx.x < kPositionSlots) {
+        const AxisPositions p = token_axes(rope, axes, tokens, column);
+        position_pages[slot * kPositionSlots + threadIdx.x] =
+            threadIdx.x < 3 ? static_cast<std::int32_t>(p.axis[threadIdx.x]) : 0;
     }
 }
 
@@ -115,6 +141,7 @@ __global__ void pool_kernel(const __nv_bfloat16* __restrict__ pages,
                             const std::int32_t* __restrict__ block_tables, int logical_pages,
                             const __nv_bfloat16* __restrict__ key_norm, int di, int ratio,
                             int width, int nb_cap, int rotary_dim, float theta, float eps,
+                            const std::int32_t* __restrict__ position_pages,
                             __nv_bfloat16* __restrict__ pooled) {
     __shared__ float stage[8][kMaxIndexD];
     const int warp  = threadIdx.x >> 5;
@@ -135,8 +162,15 @@ __global__ void pool_kernel(const __nv_bfloat16* __restrict__ pages,
         v[d] = bf(sum / ratio);
     }
     __syncwarp();
-    norm_rope_vector(v, di, key_norm, eps, static_cast<std::int64_t>(block) * ratio, rotary_dim,
-                     theta,
+    // A pooled block rotates with the RoPE position of its first token.
+    AxisPositions start = uniform_axes(static_cast<std::int64_t>(block) * ratio);
+    if (position_pages != nullptr) {
+        const std::int64_t slot = index_slot(block_tables, logical_pages, row,
+                                             static_cast<std::int64_t>(block) * ratio);
+        start = {{position_pages[slot * kPositionSlots], position_pages[slot * kPositionSlots + 1],
+                  position_pages[slot * kPositionSlots + 2]}};
+    }
+    norm_rope_vector(v, di, key_norm, eps, start, rotary_dim, theta,
                      pooled + (static_cast<std::int64_t>(seq) * nb_cap + block) * di);
 }
 
@@ -467,23 +501,29 @@ void qsa_prepare_query_launch(const Tensor& q, const Tensor& weight, const Tenso
                               cudaStream_t stream) {
     const int di = q.ne[0], heads = q.ne[1];
     const int vectors = static_cast<int>(q.numel() / di);
+    const int axes    = positions.numel() == vectors / heads ? 1 : 3;
     prepare_query_kernel<<<(vectors + 7) / 8, 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(weight.data),
-        static_cast<const std::int32_t*>(positions.data), di, heads, vectors, rotary_dim, theta,
-        eps, static_cast<__nv_bfloat16*>(out.data));
+        static_cast<const std::int32_t*>(positions.data), axes, di, heads, vectors, rotary_dim,
+        theta, eps, static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
 void qsa_index_append_launch(const Tensor& keys, const Tensor& positions, const Tensor& rows,
                              const Tensor& index_pages, const Tensor& block_tables,
+                             const Tensor& rope_positions, const Tensor& position_pages,
                              cudaStream_t stream) {
     const int di = keys.ne[0], width = keys.ne[1], sequences = keys.ne[2];
-    index_append_kernel<<<width * sequences, 128, 0, stream>>>(
+    const int tokens = width * sequences;
+    const int axes   = rope_positions.data == nullptr || rope_positions.numel() == tokens ? 1 : 3;
+    index_append_kernel<<<tokens, 128, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(keys.data),
         static_cast<const std::int32_t*>(positions.data),
         static_cast<const std::int32_t*>(rows.data),
         static_cast<const std::int32_t*>(block_tables.data), block_tables.ne[0], di, width,
-        static_cast<__nv_bfloat16*>(index_pages.data));
+        static_cast<__nv_bfloat16*>(index_pages.data),
+        static_cast<const std::int32_t*>(rope_positions.data), axes, tokens,
+        static_cast<std::int32_t*>(position_pages.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -494,7 +534,8 @@ std::size_t qsa_select_workspace_launch_bytes(std::int32_t ratio, std::int32_t i
 }
 
 void qsa_select_launch(const Tensor& query, const Tensor& positions, const Tensor& rows,
-                       const Tensor& index_pages, const Tensor& block_tables,
+                       const Tensor& index_pages, const Tensor& position_pages,
+                       const Tensor& block_tables,
                        const Tensor& key_norm, std::int32_t ratio, std::int32_t budget,
                        std::int32_t rotary_dim, float theta, float eps, std::int32_t max_visible,
                        void* workspace, Tensor& selected, Tensor& counts, cudaStream_t stream) {
@@ -510,7 +551,7 @@ void qsa_select_launch(const Tensor& query, const Tensor& positions, const Tenso
         static_cast<const __nv_bfloat16*>(index_pages.data), pos,
         static_cast<const std::int32_t*>(rows.data), bt, block_tables.ne[0],
         static_cast<const __nv_bfloat16*>(key_norm.data), di, ratio, width, nb_cap, rotary_dim,
-        theta, eps, pooled);
+        theta, eps, static_cast<const std::int32_t*>(position_pages.data), pooled);
     CUDA_CHECK(cudaGetLastError());
     const std::size_t shared =
         static_cast<std::size_t>(kScoreBlocks + kScoreColumns * heads) * di * sizeof(float);

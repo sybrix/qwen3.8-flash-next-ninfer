@@ -36,6 +36,8 @@ serving() {
     local pid exe
     for pid in $(pgrep -x ninfer-serve 2>/dev/null); do
         exe=$(readlink -f "/proc/${pid}/exe" 2>/dev/null) || continue
+        # A server started before a rebuild runs a replaced binary: "<path> (deleted)".
+        exe=${exe% (deleted)}
         case "$exe" in
             "$PROD_BIN")  echo "27b" ; return ;;
             "$FLASH_BIN") echo "flash-next" ; return ;;

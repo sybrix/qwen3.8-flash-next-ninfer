@@ -12,7 +12,7 @@ mkdir -p "$out"
 rm -f "$out/done"
 exec > "$out/log.txt" 2>&1
 
-A=$HOME/Projects/ninfer-flash-next/models/qwen3_8_flash_next_nvfp4_mtp.ninfer
+A=$HOME/Projects/ninfer-flash-next/models/qwen3_8_flash_next_nvfp4_mtp_vision.ninfer
 # Pre-flight, before the 27B is touched: Mapped PLE shards must not straddle container files,
 # so the artifact must be one complete file.
 if [ ! -f "$A" ] || compgen -G "$A.part-*" >/dev/null || compgen -G "$(dirname "$A")/.*.tmp" >/dev/null; then

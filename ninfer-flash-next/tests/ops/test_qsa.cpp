@@ -1,6 +1,7 @@
 #include "ninfer/ops/qsa.h"
 #include "ops/op_tester.h"
 
+#include <array>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
@@ -33,7 +34,9 @@ std::vector<std::uint16_t> bits(const std::vector<float>& v) {
 }
 
 // Mirror of the contract's rounding points: BF16 norm output, BF16 cos/sin and BF16 products.
-std::vector<float> norm_rope(const float* x, const std::vector<float>& w, std::int64_t pos) {
+// pos[a] is the RoPE position of axis a; pair i rotates with axis i%3 (Text MRoPE).
+std::vector<float> norm_rope(const float* x, const std::vector<float>& w,
+                             std::array<std::int64_t, 3> pos) {
     double sum = 0;
     for (int d = 0; d < kDi; ++d) sum += double(x[d]) * x[d];
     const double inv = 1.0 / std::sqrt(sum / kDi + kEps);
@@ -46,12 +49,16 @@ std::vector<float> norm_rope(const float* x, const std::vector<float>& w, std::i
         }
         const int half = kRotary / 2, pair = d < half ? d : d - half;
         const float inv_freq = 1.0f / std::pow(kTheta, float(2 * pair) / kRotary);
-        const float angle    = float(pos) * inv_freq;
+        const float angle    = float(pos[pair % 3]) * inv_freq;
         const float c = bfr(std::cos(angle)), s = bfr(std::sin(angle));
         const float rotated = d < half ? -n[d + half] : n[d - half];
         out[d]              = bfr(bfr(double(n[d]) * c) + bfr(double(rotated) * s));
     }
     return out;
+}
+
+std::vector<float> norm_rope(const float* x, const std::vector<float>& w, std::int64_t pos) {
+    return norm_rope(x, w, std::array<std::int64_t, 3>{pos, pos, pos});
 }
 
 struct Cache {
@@ -96,6 +103,33 @@ int prepare_query_case(std::mt19937& rng) {
            dout.verify_guards("qsa_prepare_query");
 }
 
+// Multimodal query positions: [T,3] axis-major with distinct axes per column.
+int prepare_query_mrope_case(std::mt19937& rng) {
+    const int width = 19, seqs = 2, columns = width * seqs;
+    std::vector<float> q(std::size_t(kDi) * kHi * columns), w(kDi);
+    std::vector<int> pos(3 * columns);
+    std::uniform_real_distribution<float> u(-3, 3);
+    std::uniform_int_distribution<int> p(0, 5000);
+    for (auto& v : q) v = bfr(u(rng));
+    for (auto& v : w) v = bfr(u(rng) * 0.1f);
+    for (auto& v : pos) v = p(rng);
+    std::vector<double> expected(q.size());
+    for (std::size_t v = 0; v < q.size() / kDi; ++v) {
+        const int c = int(v / kHi);
+        const auto r = norm_rope(&q[v * kDi], w, {pos[c], pos[columns + c], pos[2 * columns + c]});
+        for (int d = 0; d < kDi; ++d) expected[v * kDi + d] = r[d];
+    }
+    auto dq = to_device(bits(q)), dw = to_device(bits(w)), dp = to_device_i32(pos);
+    GuardedDeviceBuffer dout(q.size() * 2);
+    Tensor tq(dq.p, DType::BF16, {kDi, kHi, width, seqs}), tw(dw.p, DType::BF16, {kDi});
+    Tensor tp(dp.p, DType::I32, {columns, 3}), to(dout.data(), DType::BF16, {kDi, kHi, width, seqs});
+    ops::qsa_prepare_query(tq, tw, tp, kRotary, kTheta, kEps, to, nullptr);
+    cuda_synchronize();
+    return verify_pointwise("qsa_prepare_query mrope", from_device_bf16(dout.data(), q.size()),
+                            expected, PointwiseCriterion{2.0e-3, 1.6e-2}) +
+           dout.verify_guards("qsa_prepare_query mrope");
+}
+
 // Reference selection for one column; returns ascending token list and the scores used.
 std::vector<int> select_reference(const std::vector<float>& query_col, // [Di,Hi]
                                   const std::vector<std::vector<float>>& pooled, std::int64_t pos,
@@ -129,8 +163,11 @@ std::vector<int> select_reference(const std::vector<float>& query_col, // [Di,Hi
     return tokens;
 }
 
+// With `mrope`, every token carries a recorded 3-axis RoPE position (a text run, then an image
+// grid with spatial axes, then text shifted by a rope delta) and pooled blocks must rotate with
+// their first token's recorded position.
 int select_case(const std::string& label, int width, const std::vector<int>& last_positions,
-                std::mt19937& rng) {
+                std::mt19937& rng, bool mrope = false) {
     const int seqs        = int(last_positions.size());
     const int max_visible = *std::max_element(last_positions.begin(), last_positions.end()) + 1;
     const int logical     = (max_visible + kPage - 1) / kPage + 1;
@@ -143,8 +180,28 @@ int select_case(const std::string& label, int width, const std::vector<int>& las
         raw[s].resize(std::size_t(last_positions[s] + 1) * kDi);
         for (auto& v : raw[s]) v = bfr(u(rng));
     }
+    // rope[s][t] = RoPE axes of token t.
+    std::vector<std::vector<std::array<std::int64_t, 3>>> rope(seqs);
+    for (int s = 0; s < seqs; ++s) {
+        rope[s].resize(std::size_t(last_positions[s] + 1));
+        const int image_begin = 300, side = 24, image_end = image_begin + side * side;
+        for (int t = 0; t <= last_positions[s]; ++t) {
+            if (!mrope || t < image_begin) {
+                rope[s][t] = {t, t, t};
+            } else if (t < image_end) {
+                const int i = t - image_begin;
+                rope[s][t] = {image_begin, image_begin + i / side, image_begin + i % side};
+            } else {
+                const int shifted = t - (image_end - image_begin) + side;
+                rope[s][t] = {shifted, shifted, shifted};
+            }
+        }
+    }
     GuardedDeviceBuffer dpages(std::size_t(cache.pages) * kPage * kDi * 2);
     dpages.fill(0);
+    GuardedDeviceBuffer dpositions(std::size_t(cache.pages) * kPage * 4 * 4);
+    dpositions.fill(0);
+    Tensor tpositions(dpositions.data(), DType::I32, {4, kPage, 1, cache.pages});
     auto dtable = to_device_i32(cache.table);
     Tensor tpages(dpages.data(), DType::BF16, {kDi, kPage, 1, cache.pages});
     Tensor ttable(dtable.p, DType::I32, {logical, seqs});
@@ -161,7 +218,16 @@ int select_case(const std::string& label, int width, const std::vector<int>& las
             auto dr = to_device_i32(r);
             Tensor tk(dk.p, DType::BF16, {kDi, n, 1}), tp(dp.p, DType::I32, {n, 1});
             Tensor tr(dr.p, DType::I32, {1});
-            ops::qsa_index_append(tk, tp, tr, tpages, ttable, nullptr);
+            if (mrope) {
+                std::vector<int> axes(3 * n);
+                for (int a = 0; a < 3; ++a)
+                    for (int i = 0; i < n; ++i) axes[a * n + i] = int(rope[s][start + i][a]);
+                auto da = to_device_i32(axes);
+                Tensor ta(da.p, DType::I32, {n, 3});
+                ops::qsa_index_append(tk, tp, tr, tpages, ttable, ta, tpositions, nullptr);
+            } else {
+                ops::qsa_index_append(tk, tp, tr, tpages, ttable, nullptr);
+            }
         }
     }
     std::vector<float> query(std::size_t(kDi) * kHi * width * seqs);
@@ -181,8 +247,13 @@ int select_case(const std::string& label, int width, const std::vector<int>& las
     Tensor trows(drows.p, DType::I32, {seqs}), tnorm(dnorm.p, DType::BF16, {kDi});
     Tensor tsel(dsel.data(), DType::I32, {max_selected, width, seqs});
     Tensor tcount(dcount.data(), DType::I32, {width, seqs});
-    ops::qsa_select(tq, tpos, trows, tpages, ttable, tnorm, geometry, max_visible, ws, tsel, tcount,
-                    nullptr);
+    if (mrope) {
+        ops::qsa_select(tq, tpos, trows, tpages, tpositions, ttable, tnorm, geometry, max_visible, ws,
+                        tsel, tcount, nullptr);
+    } else {
+        ops::qsa_select(tq, tpos, trows, tpages, ttable, tnorm, geometry, max_visible, ws, tsel,
+                        tcount, nullptr);
+    }
     cuda_synchronize();
     const auto got    = from_device<std::int32_t>(dsel.data(), std::size_t(max_selected) * width * seqs);
     const auto counts = from_device<std::int32_t>(dcount.data(), std::size_t(width) * seqs);
@@ -199,7 +270,7 @@ int select_case(const std::string& label, int width, const std::vector<int>& las
                 for (int j = 0; j < kRatio; ++j) sum += raw[s][std::size_t(b * kRatio + j) * kDi + d];
                 mean[d] = bfr(sum / kRatio);
             }
-            pooled[b] = norm_rope(mean.data(), norm, std::int64_t(b) * kRatio);
+            pooled[b] = norm_rope(mean.data(), norm, rope[s][std::size_t(b) * kRatio]);
         }
         for (int w = 0; w < width; ++w) {
             const int column = s * width + w;
@@ -362,10 +433,14 @@ int main() {
     }
     std::mt19937 rng(20261001);
     int failures = prepare_query_case(rng);
+    failures += prepare_query_mrope_case(rng);
     // Prefill chunk crossing the dense-equivalent boundary (positions 1950..2149).
     failures += select_case("qsa_select prefill", 200, {2149}, rng);
     // Decode rows: dense, exactly at the boundary (2051 visible), first sparse (2052), long.
     failures += select_case("qsa_select decode", 1, {99, 2050, 2051, 9000}, rng);
+    // Multimodal: recorded image-grid / rope-delta positions, prefill and decode.
+    failures += select_case("qsa_select mrope prefill", 200, {2149}, rng, true);
+    failures += select_case("qsa_select mrope decode", 1, {2051, 5000}, rng, true);
     failures += sparse_attention_case(KvCacheStorage::BFloat16, rng);
     failures += sparse_attention_case(KvCacheStorage::Fp8E4M3Row256, rng);
     std::cout << (failures ? "FAIL" : "OK") << " qsa\n";

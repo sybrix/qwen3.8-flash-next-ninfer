@@ -88,6 +88,8 @@ public:
     // BF16 [index_head_dim, P, 1, pages] raw QSA index keys of one layer; block tables are shared
     // with the layer's K/V.
     [[nodiscard]] Tensor index_pages(std::uint32_t layer) const;
+    // I32 [4, P, 1, pages]: per-token RoPE positions (three axes, pad) for QSA; shared by layers.
+    [[nodiscard]] Tensor rope_position_pages() const;
     [[nodiscard]] const Tensor& block_tables() const;
     [[nodiscard]] std::int32_t index_head_dim() const noexcept { return index_head_dim_; }
 

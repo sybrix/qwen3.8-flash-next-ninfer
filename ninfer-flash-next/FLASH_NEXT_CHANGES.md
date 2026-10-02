@@ -17,6 +17,7 @@ model mathematics and the implementation status.
 | 3 | Tensor-core MoE prefill and tensor-core sparse attention (~9× prompt throughput). |
 | MTP | The model's MTP draft head for speculative decoding, with the GDN and PLE state record/fold rollback it needs. |
 | Prefill I/O | The n-gram table gather is parallelized so cold page-cache prompts aren't disk-latency bound. |
+| Vision | Image input through the Qwen3.5 vision tower (Q8, MLP zero-padded 4304 → 4352), 3-axis RoPE positions recorded in the KV cache for QSA. |
 
 ## Commit log (oldest first)
 
@@ -187,5 +188,25 @@ every read is a synchronous NVMe page fault (~60 us), so a 7.7K-token prompt spe
 the serial host gather (server TTFT 8.3 s after the cache had been evicted). Gathers of 128+
 columns now split across up to 16 threads, overlapping the faults (~8x measured on the table:
 ~0.9 s cold for 7.7K tokens). Output is byte-identical; decode/verify gathers stay serial.
+
+
+### feat(qwen4_exp): image input via the Qwen3.5 vision tower
+
+Qwen3.8-Flash-Next's vision tower, image placeholders and 3-axis Text MRoPE are identical to
+Qwen3.5's (transformers qwen4_exp vs qwen3_5), so the existing Vision runtime is reused:
+
+- Converter: --components text,mtp,vision. The vision MLP is zero-padded 4304 -> 4352 (exact)
+  so every vision projection runs at Q8; new Q8 shapes 3456x1152, 1152x1152, 4352x1152,
+  1152x4352, 1152x1536, 2560x4608 (column extent up to 131072 patches). The Qwen3.5 Q4/Q5
+  vision mix moved real image embeddings ~35% from BF16; Q8 ~6%.
+- Prefill scatters vision embeddings into the [H,T] token embedding before the stream
+  broadcast; PLE hashes the multimodal prompt ids.
+- QSA: index queries rotate with the columns' RoPE positions ([T] or [T,3]); a per-token RoPE
+  position plane (I32 [4,64,1,pages]) in the Main and MTP paged pools lets pooled blocks rotate
+  with their first token's recorded multimodal position. New qsa overloads; tests cover 3-axis
+  positions and fail without the plane.
+
+Real model vs the PyTorch reference (teacher-forced): chart image 121/128, image + 3K-token text
+(sparse QSA) 88/96, mismatches near-ties. Decode with MTP K=3: 110 tok/s (short), 91 tok/s (3.4K).
 
 
